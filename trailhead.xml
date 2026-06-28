@@ -25,9 +25,13 @@ Commands:
   trailhead missing         Show only missing/unreachable areas.
   trailhead area <key>      Show one area.
   trailhead monitor [on|off] Record observed mapper walks. Default: off.
-  trailhead walks [limit]   Show longest confirmed mapper walks.
-  trailhead walks all [n]   Include unconfirmed/search observations.
+  trailhead threshold [n]   Record walks longer than n steps. Default: 10.
+  trailhead walks [n] [area] Show longest confirmed mapper walks. Default: 10.
+  trailhead walks all [n] [area] Include unconfirmed/search observations.
   trailhead source [room]   Show or set the source room. Default: 32418.
+  trailhead version         Show installed version.
+  trailhead reload          Reload the plugin.
+  trailhead update [confirm] Check GitHub; confirm downloads and reloads.
   trailhead help            Show help.
 
 Short alias: th

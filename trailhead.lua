@@ -4,6 +4,12 @@ local GMCP_ID = "3e7dedbe37e44942dd46d264"
 local SND_ID = "30000000537461726C696E67"
 local DEFAULT_SOURCE = "32418"
 local DEFAULT_TIMEOUT = 0.35
+local DEFAULT_WALK_THRESHOLD = 10
+local DEFAULT_WALKS_LIMIT = 10
+local UPDATE_XML_URL = "https://raw.githubusercontent.com/rodarvus/trailhead/main/trailhead.xml"
+local UPDATE_LUA_URL = "https://raw.githubusercontent.com/rodarvus/trailhead/main/trailhead.lua"
+
+local async_ok, async = pcall(require, "async")
 
 local trailhead = {
   active = false,
@@ -34,7 +40,8 @@ local function warn(text) note("yellow", text) end
 local function fail(text) note("red", text) end
 
 local function trim(value)
-  return tostring(value or ""):gsub("^%s*(.-)%s*$", "%1")
+  local trimmed = tostring(value or ""):gsub("^%s*(.-)%s*$", "%1")
+  return trimmed
 end
 
 local function lower(value)
@@ -323,6 +330,18 @@ local function set_monitor_enabled(enabled)
   SetVariable("trailhead_monitor", enabled and "on" or "off")
 end
 
+local function walk_threshold()
+  local value = tonumber(trim(GetVariable("trailhead_walk_threshold") or ""))
+  if value and value >= 0 then
+    return math.floor(value)
+  end
+  return DEFAULT_WALK_THRESHOLD
+end
+
+local function set_walk_threshold(value)
+  SetVariable("trailhead_walk_threshold", tostring(value))
+end
+
 local function parse_lua_assignment(text)
   local env = {}
   local chunk, err = loadstring(tostring(text or ""))
@@ -479,11 +498,38 @@ local function last_insert_id(db)
   return id
 end
 
+local function existing_mapper_event_id(db, event)
+  local id = nil
+  pcall(function()
+    for row in db:nrows(
+      "SELECT id FROM mapper_events " ..
+      "WHERE COALESCE(source_room, '') = " .. sql_literal(event.source_room or "") .. " " ..
+      "AND COALESCE(destination_room, '') = " .. sql_literal(event.destination_room or "") .. " " ..
+      "AND steps = " .. sql_number(event.steps) .. " " ..
+      "ORDER BY movement_confirmed DESC, observed_at DESC, id DESC LIMIT 1"
+    ) do
+      id = tonumber(row.id)
+    end
+  end)
+  return id
+end
+
 local function insert_mapper_event(event)
+  local steps = tonumber(event.steps)
+  if not steps or steps <= walk_threshold() then
+    return nil
+  end
+
   local db, err = ensure_catalogue_db()
   if not db then
     warn("Trailhead monitor: " .. tostring(err))
     return nil
+  end
+
+  local existing = existing_mapper_event_id(db, event)
+  if existing then
+    close_db(db)
+    return existing
   end
 
   local sql = string.format([[
@@ -1166,11 +1212,28 @@ local function monitor_command(arg)
     good("Trailhead monitor is off.")
   elseif arg == "" or arg == "status" then
     info("Trailhead monitor: " .. (monitor_enabled() and "on" or "off"))
+    info("Walk threshold: more than " .. tostring(walk_threshold()) .. " step(s)")
     info("Catalogue: " .. tostring(trailhead_db_path() or "(unavailable)"))
     info("Events: " .. tostring(catalogue_count()))
   else
     warn("Usage: trailhead monitor [on|off]")
   end
+end
+
+local function threshold_command(arg)
+  arg = trim(arg)
+  if arg == "" then
+    info("Trailhead walk threshold: more than " .. tostring(walk_threshold()) .. " step(s)")
+    return
+  end
+  local value = tonumber(arg)
+  if not value or value < 0 then
+    warn("Usage: trailhead threshold [steps]")
+    return
+  end
+  value = math.floor(value)
+  set_walk_threshold(value)
+  good("Trailhead will record walks longer than " .. tostring(value) .. " step(s).")
 end
 
 local function display_value(value, fallback)
@@ -1181,19 +1244,38 @@ local function display_value(value, fallback)
   return value
 end
 
-local function show_walks(arg)
+local function parse_walks_args(arg)
   arg = trim(arg)
   local include_all = false
-  local limit = 20
+  local limit = DEFAULT_WALKS_LIMIT
+  local area = arg
+
   local first, rest = arg:match("^(%S+)%s*(.-)$")
   if lower(first or "") == "all" then
     include_all = true
-    local trimmed_rest = trim(rest)
-    limit = tonumber(trimmed_rest) or limit
-  elseif first and first ~= "" then
-    limit = tonumber(first) or limit
+    area = trim(rest)
   end
-  limit = math.max(1, math.min(tonumber(limit) or 20, 200))
+
+  local limit_token, area_rest = area:match("^(%d+)%s*(.-)$")
+  if limit_token then
+    limit = tonumber(limit_token) or limit
+    area = trim(area_rest)
+  else
+    local before, trailing_limit = area:match("^(.-)%s+(%d+)$")
+    if trailing_limit then
+      limit = tonumber(trailing_limit) or limit
+      area = trim(before)
+    elseif tonumber(area) then
+      limit = tonumber(area) or limit
+      area = ""
+    end
+  end
+
+  return include_all, math.max(1, math.min(tonumber(limit) or DEFAULT_WALKS_LIMIT, 200)), area
+end
+
+local function show_walks(arg)
+  local include_all, limit, area = parse_walks_args(arg)
 
   local path = trailhead_db_path()
   if not path or not file_exists(path) then
@@ -1207,6 +1289,13 @@ local function show_walks(arg)
   end
 
   local where = include_all and "1 = 1" or "movement_confirmed = 1"
+  if area ~= "" then
+    local pattern = "%" .. area .. "%"
+    where = "(" .. where .. ") AND (" ..
+      "COALESCE(destination_area_name, '') LIKE " .. sql_literal(pattern) .. " " ..
+      "OR COALESCE(destination_area, '') = " .. sql_literal(area) ..
+      ")"
+  end
   local shown = 0
   info("+-------+---------+----------------------+----------------------+----------------------+----------------+")
   info("| Steps | L/T     | From                 | To                   | Destination          | Seen           |")
@@ -1243,7 +1332,11 @@ local function show_walks(arg)
     return
   end
   info("+-------+---------+----------------------+----------------------+----------------------+----------------+")
-  info("shown " .. shown .. " walk" .. (shown == 1 and "" or "s") .. (include_all and " (all observations)" or ""))
+  local suffix = include_all and " (all observations)" or ""
+  if area ~= "" then
+    suffix = suffix .. " for area '" .. area .. "'"
+  end
+  info("shown " .. shown .. " walk" .. (shown == 1 and "" or "s") .. suffix)
 end
 
 local function show_help()
@@ -1254,9 +1347,13 @@ local function show_help()
   info("  trailhead missing         Show no-start/no-path/portal-only rows.")
   info("  trailhead area <key>      Show one area key or name fragment.")
   info("  trailhead monitor [on|off]  Record observed mapper walks. Default: off.")
-  info("  trailhead walks [limit]   Show longest confirmed mapper walks.")
-  info("  trailhead walks all [n]   Include unconfirmed/search observations.")
+  info("  trailhead threshold [n]   Record walks longer than n steps. Default: 10.")
+  info("  trailhead walks [n] [area]  Show longest confirmed mapper walks. Default: 10.")
+  info("  trailhead walks all [n] [area]  Include unconfirmed/search observations.")
   info("  trailhead source [room]   Show or set source room. Default: 32418.")
+  info("  trailhead version         Show installed version.")
+  info("  trailhead reload          Reload the plugin.")
+  info("  trailhead update [confirm]  Check GitHub; confirm downloads and reloads.")
   info("Walk asks mapper findpath with no portals/recalls. Portal allows them.")
 end
 
@@ -1276,6 +1373,225 @@ local function source_command(arg)
   persist_cache()
   good("Trailhead source room set to " .. source_room())
   warn("Trailhead cached distances were cleared; run 'trailhead refresh'.")
+end
+
+local function plugin_file_path()
+  if type(GetPluginInfo) == "function" and type(GetPluginID) == "function" then
+    local ok, path = pcall(GetPluginInfo, GetPluginID(), 6)
+    if ok and path and path ~= "" then
+      return tostring(path)
+    end
+  end
+  return plugin_script_dir() .. "trailhead.xml"
+end
+
+local function lua_file_path()
+  return plugin_script_dir() .. "trailhead.lua"
+end
+
+local function read_file(path)
+  local f = io and io.open and io.open(path, "rb") or nil
+  if not f then
+    return nil
+  end
+  local data = f:read("*a")
+  f:close()
+  return data
+end
+
+local function write_file(path, data)
+  local f, err = io.open(path, "wb")
+  if not f then
+    return nil, err
+  end
+  f:write(data)
+  f:close()
+  return true, nil
+end
+
+local function parse_xml_version(page)
+  return tostring(page or ""):match('<plugin[^>]-version%s*=%s*"([^"]+)"')
+end
+
+local function current_version()
+  local version = parse_xml_version(read_file(plugin_file_path()))
+  if version and version ~= "" then
+    return version
+  end
+  if type(GetPluginInfo) == "function" and type(GetPluginID) == "function" then
+    local ok, info_version = pcall(GetPluginInfo, GetPluginID(), 19)
+    if ok and info_version and info_version ~= "" then
+      return tostring(info_version)
+    end
+  end
+  return TRAILHEAD_VERSION
+end
+
+local function version_parts(version)
+  local parts = {}
+  for part in tostring(version or ""):gmatch("(%d+)") do
+    parts[#parts + 1] = tonumber(part) or 0
+  end
+  return parts
+end
+
+local function compare_versions(a, b)
+  local aa = version_parts(a)
+  local bb = version_parts(b)
+  local count = math.max(#aa, #bb)
+  if count > 0 then
+    for i = 1, count do
+      local av = aa[i] or 0
+      local bv = bb[i] or 0
+      if av < bv then
+        return -1
+      elseif av > bv then
+        return 1
+      end
+    end
+    return 0
+  end
+  if tostring(a) == tostring(b) then
+    return 0
+  end
+  return tostring(a) < tostring(b) and -1 or 1
+end
+
+local function trigger_reload()
+  local plugin_id = GetPluginID()
+  SetVariable("_reload_from_version", current_version())
+  if type(GetAlphaOption) == "function" and type(SetAlphaOption) == "function" and type(Execute) == "function" then
+    local prefix = GetAlphaOption("script_prefix") or ""
+    if prefix == "" then
+      prefix = "\\\\\\"
+      SetAlphaOption("script_prefix", prefix)
+    end
+    Execute(prefix .. "DoAfterSpecial(1, \"ReloadPlugin('" .. plugin_id .. "')\", 12)")
+  elseif type(DoAfterSpecial) == "function" then
+    DoAfterSpecial(1, "ReloadPlugin('" .. plugin_id .. "')", 12)
+  else
+    warn("Trailhead: reload scheduled failed; please reload the plugin manually.")
+  end
+end
+
+local function reload_command()
+  local version = current_version()
+  good("Trailhead reloading v" .. version .. " in 1s...")
+  trigger_reload()
+end
+
+local function show_version()
+  good("Trailhead v" .. current_version())
+  info("Update: " .. UPDATE_XML_URL)
+end
+
+local function fetch_url(url, callback)
+  if not async_ok or type(async) ~= "table" or type(async.doAsyncRemoteRequest) ~= "function" then
+    callback(nil, "The async library is not available.")
+    return
+  end
+  async.doAsyncRemoteRequest(url, function(retval, page, status)
+    status = tonumber(status)
+    if status ~= 200 then
+      callback(nil, "Fetch failed for " .. url .. ": HTTP " .. tostring(status or retval or "?"))
+      return
+    end
+    if not page or page == "" then
+      callback(nil, "Empty response from " .. url)
+      return
+    end
+    callback(page, nil)
+  end, "HTTPS")
+end
+
+local function validate_update_payload(xml_page, lua_page)
+  local upstream = parse_xml_version(xml_page)
+  if not upstream then
+    return nil, "Could not parse the upstream version from trailhead.xml."
+  end
+  if not tostring(xml_page or ""):find('id="747261696c68656164303130"', 1, true) then
+    return nil, "Downloaded XML does not look like Trailhead."
+  end
+  if not tostring(xml_page or ""):find("trailhead.lua", 1, true) then
+    return nil, "Downloaded XML does not load trailhead.lua."
+  end
+  if not tostring(lua_page or ""):find("TRAILHEAD_VERSION", 1, true) then
+    return nil, "Downloaded Lua does not look like Trailhead."
+  end
+  return upstream, nil
+end
+
+local function install_update(xml_page, lua_page, upstream, current)
+  local ok_lua, err_lua = write_file(lua_file_path(), lua_page)
+  if not ok_lua then
+    fail("Trailhead update: could not write trailhead.lua: " .. tostring(err_lua))
+    return
+  end
+  local ok_xml, err_xml = write_file(plugin_file_path(), xml_page)
+  if not ok_xml then
+    fail("Trailhead update: could not write trailhead.xml: " .. tostring(err_xml))
+    return
+  end
+  good("Trailhead updated v" .. current .. " -> v" .. upstream .. ". Reloading...")
+  trigger_reload()
+end
+
+local function update_command(arg)
+  arg = lower(trim(arg))
+  local install = false
+  if arg == "" then
+    install = false
+  elseif arg == "confirm" then
+    install = true
+  else
+    warn("Usage: trailhead update [confirm]")
+    return
+  end
+
+  local current = current_version()
+  info("Trailhead: fetching " .. UPDATE_XML_URL)
+  fetch_url(UPDATE_XML_URL, function(xml_page, xml_err)
+    if not xml_page then
+      fail("Trailhead update: " .. tostring(xml_err))
+      return
+    end
+    local upstream = parse_xml_version(xml_page)
+    if not upstream then
+      fail("Trailhead update: could not parse the upstream version.")
+      return
+    end
+    local cmp = compare_versions(upstream, current)
+    if not install then
+      if cmp == 0 then
+        good("Trailhead is up to date (v" .. current .. ").")
+      elseif cmp < 0 then
+        warn("Local Trailhead v" .. current .. " is newer than upstream v" .. upstream .. ".")
+      else
+        warn("Trailhead update available: v" .. current .. " -> v" .. upstream .. ". Run 'trailhead update confirm' to install.")
+      end
+      return
+    end
+
+    if cmp < 0 then
+      warn("Upstream Trailhead v" .. upstream .. " is older than local v" .. current .. "; installing anyway.")
+    elseif cmp == 0 then
+      info("Trailhead is already v" .. current .. "; reinstalling from GitHub.")
+    end
+
+    info("Trailhead: fetching " .. UPDATE_LUA_URL)
+    fetch_url(UPDATE_LUA_URL, function(lua_page, lua_err)
+      if not lua_page then
+        fail("Trailhead update: " .. tostring(lua_err))
+        return
+      end
+      local validated_version, validation_err = validate_update_payload(xml_page, lua_page)
+      if not validated_version then
+        fail("Trailhead update: " .. tostring(validation_err))
+        return
+      end
+      install_update(xml_page, lua_page, validated_version, current)
+    end)
+  end)
 end
 
 local function area_filter(value)
@@ -1319,10 +1635,18 @@ function trailhead_alias(name, line, wildcards)
     end
   elseif command == "monitor" then
     monitor_command(rest)
+  elseif command == "threshold" then
+    threshold_command(rest)
   elseif command == "walks" then
     show_walks(rest)
   elseif command == "source" then
     source_command(rest)
+  elseif command == "version" then
+    show_version()
+  elseif command == "reload" then
+    reload_command()
+  elseif command == "update" then
+    update_command(rest)
   elseif command == "help" or command == "?" then
     show_help()
   else
@@ -1337,9 +1661,20 @@ end
 
 function OnPluginInstall()
   local loaded = load_cache()
+  local version = current_version()
+  local from_version = trim(GetVariable("_reload_from_version") or "")
+  if from_version ~= "" then
+    SetVariable("_reload_from_version", "")
+    if from_version == version then
+      good("Trailhead v" .. version .. " reloaded. Type 'trailhead help'.")
+    else
+      good("Trailhead reloaded v" .. from_version .. " -> v" .. version .. ". Type 'trailhead help'.")
+    end
+    return
+  end
   if loaded then
-    good("Trailhead v" .. TRAILHEAD_VERSION .. " installed with " .. #trailhead.rows .. " cached areas. Type 'trailhead help'.")
+    good("Trailhead v" .. version .. " installed with " .. #trailhead.rows .. " cached areas. Type 'trailhead help'.")
   else
-    good("Trailhead v" .. TRAILHEAD_VERSION .. " installed. Type 'trailhead help'.")
+    good("Trailhead v" .. version .. " installed. Type 'trailhead help'.")
   end
 end
