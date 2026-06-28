@@ -1,4 +1,4 @@
-local TRAILHEAD_VERSION = "0.1"
+local TRAILHEAD_VERSION = "0.2"
 local MAPPER_ID = "b6eae87ccedd84f510b74714"
 local GMCP_ID = "3e7dedbe37e44942dd46d264"
 local SND_ID = "30000000537461726C696E67"
@@ -56,6 +56,36 @@ local function slash(path)
   return path
 end
 
+local function get_info(number)
+  if type(GetInfo) ~= "function" then
+    return nil
+  end
+  local ok, value = pcall(GetInfo, number)
+  if ok and value and value ~= "" then
+    return tostring(value)
+  end
+  return nil
+end
+
+local function plugin_id()
+  if type(GetPluginID) == "function" then
+    local ok, id = pcall(GetPluginID)
+    if ok and id and id ~= "" then
+      return tostring(id)
+    end
+  end
+  return "747261696c68656164303130"
+end
+
+local function normalize_state_dir(path)
+  path = tostring(path or "")
+  if path == "" then
+    return nil
+  end
+  path = path:gsub("\\", "/"):gsub("/%./", "/")
+  return slash(path)
+end
+
 local function parent_dir(path)
   path = slash(path)
   local without_tail = path:gsub("/$", "")
@@ -91,11 +121,7 @@ local function proteles_database_dir()
 end
 
 local function plugin_data_dir()
-  local ok, dir = pcall(GetInfo, 66)
-  if ok and dir and dir ~= "" then
-    return slash(dir)
-  end
-  return ""
+  return slash(get_info(66) or "")
 end
 
 local function plugin_script_dir()
@@ -106,6 +132,27 @@ local function plugin_script_dir()
     end
   end
   return ""
+end
+
+local function plugin_state_dir()
+  local db_dir = proteles_database_dir()
+  if db_dir then
+    return db_dir
+  end
+
+  local state_base = get_info(85)
+  if not state_base then
+    return nil
+  end
+
+  local state_dir = state_base .. "trailhead-" .. plugin_id()
+  if state_dir:find("^%.") then
+    local current_dir = get_info(64)
+    if current_dir and current_dir ~= "" then
+      state_dir = current_dir .. state_dir
+    end
+  end
+  return normalize_state_dir(state_dir)
 end
 
 local function snd_db_path()
@@ -144,24 +191,70 @@ end
 
 local function trailhead_db_candidates()
   local candidates = {}
+  local state_dir = plugin_state_dir()
+  if state_dir then
+    candidates[#candidates + 1] = state_dir .. "trailhead.db"
+  end
+
   local script_dir = plugin_script_dir()
-  local base = plugin_data_dir()
   if script_dir ~= "" then
     candidates[#candidates + 1] = script_dir .. "data/trailhead.db"
-    candidates[#candidates + 1] = script_dir .. "trailhead.db"
-  end
-  if base ~= "" then
-    candidates[#candidates + 1] = base .. "trailhead.db"
   end
   return candidates
 end
 
 local function trailhead_db_path()
-  local existing = first_existing(trailhead_db_candidates())
-  if existing then
-    return existing
+  local candidates = trailhead_db_candidates()
+  if #candidates == 0 then
+    return nil
   end
-  return trailhead_db_candidates()[1]
+  return candidates[1]
+end
+
+local function directory_exists(path)
+  if not path or path == "" then
+    return false
+  end
+  if type(utils) == "table" and type(utils.readdir) == "function" then
+    local ok, result = pcall(utils.readdir, path)
+    if ok and result then
+      return true
+    end
+  end
+  local marker = path:gsub("/$", "") .. "/."
+  local f = io and io.open and io.open(marker, "rb") or nil
+  if f then
+    f:close()
+    return true
+  end
+  return false
+end
+
+local function make_directory(path)
+  if not path or path == "" or directory_exists(path) then
+    return true
+  end
+
+  if type(utils) == "table" and type(utils.shellexecute) == "function" then
+    local ok = pcall(utils.shellexecute, "cmd", '/C mkdir "' .. path .. '"', get_info(64) or "", "open", 0)
+    if ok and directory_exists(path) then
+      return true
+    end
+  end
+
+  if os and type(os.execute) == "function" then
+    local quoted = '"' .. path:gsub('"', '\\"') .. '"'
+    local ok = os.execute("mkdir -p " .. quoted)
+    if ok == true or ok == 0 then
+      return true
+    end
+    os.execute('mkdir "' .. path .. '"')
+    if directory_exists(path) then
+      return true
+    end
+  end
+
+  return directory_exists(path)
 end
 
 local function ensure_sqlite()
@@ -201,6 +294,10 @@ local function open_writable_db(path)
   end
   if not path or path == "" then
     return nil, "Trailhead database path is not available"
+  end
+  local dir = parent_dir(path)
+  if dir ~= "" and not make_directory(dir) then
+    return nil, "could not create " .. tostring(dir)
   end
   local ok, db = pcall(sqlite3.open, path)
   if not ok or not db then
@@ -359,7 +456,7 @@ end
 local function gmcp_value(path)
   if type(gmcp) == "function" then
     local ok, value = pcall(gmcp, path)
-    if ok and type(value) == "table" then
+    if ok and value ~= nil and value ~= "" then
       return value
     end
   end
@@ -380,6 +477,42 @@ local function gmcp_value(path)
     return nil
   end
   return env.data
+end
+
+local function gmcp_number(path)
+  local value = gmcp_value(path)
+  if type(value) == "table" then
+    return nil
+  end
+  return tonumber(value)
+end
+
+local function request_character_context()
+  if type(Send_GMCP_Packet) == "function" then
+    pcall(Send_GMCP_Packet, "request char")
+    return
+  end
+  if type(CallPlugin) == "function" then
+    pcall(CallPlugin, GMCP_ID, "Send_GMCP_Packet", "request char")
+  end
+end
+
+local function refresh_character_context()
+  local status = gmcp_value("char.status")
+  if type(status) == "table" then
+    trailhead.gmcp.level = tonumber(status.level) or trailhead.gmcp.level
+    trailhead.gmcp.state = tonumber(status.state) or trailhead.gmcp.state
+  end
+
+  local base = gmcp_value("char.base")
+  if type(base) == "table" then
+    trailhead.gmcp.tier = tonumber(base.tier) or trailhead.gmcp.tier
+    trailhead.gmcp.character = base.name and tostring(base.name) or trailhead.gmcp.character
+    trailhead.gmcp.level = trailhead.gmcp.level or tonumber(base.level)
+  end
+
+  trailhead.gmcp.level = trailhead.gmcp.level or gmcp_number("char.status.level") or gmcp_number("char.base.level")
+  trailhead.gmcp.tier = trailhead.gmcp.tier or gmcp_number("char.base.tier")
 end
 
 local function update_gmcp(package)
@@ -405,6 +538,9 @@ local function update_gmcp(package)
       trailhead.gmcp.tier = tonumber(base.tier) or trailhead.gmcp.tier
       trailhead.gmcp.character = base.name and tostring(base.name) or trailhead.gmcp.character
     end
+  end
+  if key == "char.status" or key == "char.base" then
+    refresh_character_context()
   end
 end
 
@@ -738,6 +874,7 @@ local function source_context()
 end
 
 local function event_from_destination(destination, steps, broadcast_id, confidence, result_count, reason, raw)
+  refresh_character_context()
   local source = source_context()
   local dest = mapper_lookup_room(destination)
   local dest_area = dest.area
@@ -1204,6 +1341,7 @@ local function monitor_command(arg)
     end
     close_db(db)
     set_monitor_enabled(true)
+    request_character_context()
     good("Trailhead monitor is on.")
     info("Catalogue: " .. trailhead_db_path())
   elseif arg == "off" then
@@ -1660,6 +1798,7 @@ function OnPluginSaveState()
 end
 
 function OnPluginInstall()
+  request_character_context()
   local loaded = load_cache()
   local version = current_version()
   local from_version = trim(GetVariable("_reload_from_version") or "")

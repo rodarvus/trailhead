@@ -43,8 +43,10 @@ th update
 
 ## Data
 
-Trailhead stores runtime state in a local SQLite database under `data/`. That
-database is intentionally ignored by git.
+Trailhead stores runtime state in a local SQLite database. On native
+MUSHclient, the catalogue lives under the plugin state directory reported by
+`GetInfo(85)`. On Proteles, it uses the per-character database directory
+reported by `proteles.databaseDir()`.
 
 ## License
 
