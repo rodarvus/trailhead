@@ -1,0 +1,1345 @@
+local TRAILHEAD_VERSION = "0.1"
+local MAPPER_ID = "b6eae87ccedd84f510b74714"
+local GMCP_ID = "3e7dedbe37e44942dd46d264"
+local SND_ID = "30000000537461726C696E67"
+local DEFAULT_SOURCE = "32418"
+local DEFAULT_TIMEOUT = 0.35
+
+local trailhead = {
+  active = false,
+  rows = {},
+  has_results = false,
+  index = 1,
+  mode = "walk",
+  prior_rows = nil,
+  waiting = nil,
+  token = 0,
+  gmcp = {},
+  room_cache = {},
+  area_cache = {},
+  pending_walk = nil
+}
+
+local function note(colour, text)
+  if ColourNote then
+    ColourNote(colour, "", tostring(text))
+  else
+    Note(tostring(text))
+  end
+end
+
+local function info(text) note("silver", text) end
+local function good(text) note("lime", text) end
+local function warn(text) note("yellow", text) end
+local function fail(text) note("red", text) end
+
+local function trim(value)
+  return tostring(value or ""):gsub("^%s*(.-)%s*$", "%1")
+end
+
+local function lower(value)
+  return string.lower(tostring(value or ""))
+end
+
+local function slash(path)
+  path = tostring(path or ""):gsub("\\", "/")
+  if path ~= "" and path:sub(-1) ~= "/" then
+    path = path .. "/"
+  end
+  return path
+end
+
+local function parent_dir(path)
+  path = slash(path)
+  local without_tail = path:gsub("/$", "")
+  return slash(without_tail:match("^(.*)/[^/]+$") or "")
+end
+
+local function file_exists(path)
+  local f = io and io.open and io.open(path, "rb") or nil
+  if f then
+    f:close()
+    return true
+  end
+  return false
+end
+
+local function first_existing(list)
+  for _, path in ipairs(list) do
+    if file_exists(path) then
+      return path
+    end
+  end
+  return nil
+end
+
+local function proteles_database_dir()
+  if type(proteles) == "table" and type(proteles.databaseDir) == "function" then
+    local ok, result = pcall(proteles.databaseDir)
+    if ok and result and result ~= "" then
+      return slash(result)
+    end
+  end
+  return nil
+end
+
+local function plugin_data_dir()
+  local ok, dir = pcall(GetInfo, 66)
+  if ok and dir and dir ~= "" then
+    return slash(dir)
+  end
+  return ""
+end
+
+local function plugin_script_dir()
+  if type(GetPluginInfo) == "function" and type(GetPluginID) == "function" then
+    local ok, dir = pcall(GetPluginInfo, GetPluginID(), 20)
+    if ok and dir and dir ~= "" then
+      return slash(dir)
+    end
+  end
+  return ""
+end
+
+local function snd_db_path()
+  local candidates = {}
+  local db_dir = proteles_database_dir()
+  local base = plugin_data_dir()
+  if db_dir then
+    candidates[#candidates + 1] = parent_dir(db_dir) .. "SnDdb.db"
+    candidates[#candidates + 1] = db_dir .. "SnDdb.db"
+  end
+  if base ~= "" then
+    candidates[#candidates + 1] = base .. "SnDdb.db"
+  end
+  return first_existing(candidates)
+end
+
+local function mapper_db_path()
+  local candidates = {}
+  local db_dir = proteles_database_dir()
+  local base = plugin_data_dir()
+  if db_dir then
+    candidates[#candidates + 1] = parent_dir(db_dir) .. "Aardwolf.db"
+    candidates[#candidates + 1] = db_dir .. "Aardwolf.db"
+  end
+  if base ~= "" then
+    candidates[#candidates + 1] = base .. "Aardwolf.db"
+    if type(WorldName) == "function" then
+      local ok, world = pcall(WorldName)
+      if ok and world and world ~= "" then
+        candidates[#candidates + 1] = base .. tostring(world) .. ".db"
+      end
+    end
+  end
+  return first_existing(candidates)
+end
+
+local function trailhead_db_candidates()
+  local candidates = {}
+  local script_dir = plugin_script_dir()
+  local base = plugin_data_dir()
+  if script_dir ~= "" then
+    candidates[#candidates + 1] = script_dir .. "data/trailhead.db"
+    candidates[#candidates + 1] = script_dir .. "trailhead.db"
+  end
+  if base ~= "" then
+    candidates[#candidates + 1] = base .. "trailhead.db"
+  end
+  return candidates
+end
+
+local function trailhead_db_path()
+  local existing = first_existing(trailhead_db_candidates())
+  if existing then
+    return existing
+  end
+  return trailhead_db_candidates()[1]
+end
+
+local function ensure_sqlite()
+  if type(sqlite3) == "table" and type(sqlite3.open) == "function" then
+    return true
+  end
+  local ok, lib = pcall(require, "lsqlite3")
+  if ok and type(lib) == "table" and type(lib.open) == "function" then
+    sqlite3 = lib
+    return true
+  end
+  return false
+end
+
+local function open_db(path, label)
+  if not ensure_sqlite() then
+    return nil, "sqlite3 is not available"
+  end
+  if not path then
+    return nil, tostring(label or "database") .. " was not found"
+  end
+  local ok, db
+  if sqlite3.OPEN_READONLY then
+    ok, db = pcall(sqlite3.open, path, sqlite3.OPEN_READONLY)
+  else
+    ok, db = pcall(sqlite3.open, path)
+  end
+  if not ok or not db then
+    return nil, "could not open " .. tostring(path)
+  end
+  return db, nil
+end
+
+local function open_writable_db(path)
+  if not ensure_sqlite() then
+    return nil, "sqlite3 is not available"
+  end
+  if not path or path == "" then
+    return nil, "Trailhead database path is not available"
+  end
+  local ok, db = pcall(sqlite3.open, path)
+  if not ok or not db then
+    return nil, "could not open " .. tostring(path)
+  end
+  return db, nil
+end
+
+local function close_db(db)
+  if db and db.close then
+    db:close()
+  elseif db and db.close_vm then
+    db:close_vm()
+  end
+end
+
+local function source_room()
+  local value = trim(GetVariable("trailhead_source") or "")
+  if value ~= "" then
+    return value
+  end
+  return DEFAULT_SOURCE
+end
+
+local function encode_field(value)
+  return tostring(value or ""):gsub("([^A-Za-z0-9_. -])", function(char)
+    return string.format("%%%02X", string.byte(char))
+  end)
+end
+
+local function decode_field(value)
+  return tostring(value or ""):gsub("%%(%x%x)", function(hex)
+    return string.char(tonumber(hex, 16))
+  end)
+end
+
+local function numeric_or_nil(value)
+  value = trim(value)
+  if value == "" then
+    return nil
+  end
+  return tonumber(value)
+end
+
+local function sql_literal(value)
+  if value == nil then
+    return "NULL"
+  end
+  if type(value) == "number" then
+    return tostring(value)
+  end
+  return "'" .. tostring(value):gsub("'", "''") .. "'"
+end
+
+local function sql_number(value)
+  local number = tonumber(value)
+  if number then
+    return tostring(number)
+  end
+  return "NULL"
+end
+
+local function db_exec(db, sql)
+  local ok, rc, err = pcall(function()
+    return db:exec(sql)
+  end)
+  if not ok then
+    return nil, tostring(rc)
+  end
+  if sqlite3 and sqlite3.OK and rc ~= sqlite3.OK then
+    local message = err
+    if db.errmsg then
+      message = message or db:errmsg()
+    end
+    return nil, tostring(message or ("sqlite result " .. tostring(rc)))
+  end
+  return true, nil
+end
+
+local function ensure_catalogue_db()
+  local db, err = open_writable_db(trailhead_db_path())
+  if not db then
+    return nil, err
+  end
+
+  local ok, exec_err = db_exec(db, [[
+    CREATE TABLE IF NOT EXISTS mapper_events (
+      id INTEGER PRIMARY KEY,
+      observed_at INTEGER NOT NULL,
+      level INTEGER,
+      tier INTEGER,
+      source_room TEXT,
+      source_room_name TEXT,
+      source_area TEXT,
+      source_area_name TEXT,
+      destination_room TEXT,
+      destination_room_name TEXT,
+      destination_area TEXT,
+      destination_area_name TEXT,
+      steps INTEGER NOT NULL,
+      broadcast_id INTEGER NOT NULL,
+      confidence TEXT NOT NULL,
+      movement_confirmed INTEGER NOT NULL DEFAULT 0,
+      result_count INTEGER NOT NULL DEFAULT 1,
+      reason TEXT,
+      snd_context_json TEXT,
+      raw TEXT
+    );
+    CREATE INDEX IF NOT EXISTS mapper_events_steps
+      ON mapper_events (movement_confirmed, steps DESC, observed_at DESC);
+    CREATE INDEX IF NOT EXISTS mapper_events_destination
+      ON mapper_events (destination_area, destination_room);
+  ]])
+  if not ok then
+    close_db(db)
+    return nil, exec_err
+  end
+
+  return db, nil
+end
+
+local function monitor_enabled()
+  return trim(GetVariable("trailhead_monitor") or "") == "on"
+end
+
+local function set_monitor_enabled(enabled)
+  SetVariable("trailhead_monitor", enabled and "on" or "off")
+end
+
+local function parse_lua_assignment(text)
+  local env = {}
+  local chunk, err = loadstring(tostring(text or ""))
+  if not chunk then
+    return nil, err
+  end
+  setfenv(chunk, env)
+  local ok, run_err = pcall(chunk)
+  if not ok then
+    return nil, run_err
+  end
+  return env.found_paths, nil
+end
+
+local function gmcp_value(path)
+  if type(gmcp) == "function" then
+    local ok, value = pcall(gmcp, path)
+    if ok and type(value) == "table" then
+      return value
+    end
+  end
+  if type(CallPlugin) ~= "function" then
+    return nil
+  end
+  local ok, rc, data = pcall(CallPlugin, GMCP_ID, "gmcpdata_as_string", path)
+  if not ok or data == nil or data == "" then
+    return nil
+  end
+  local env = {}
+  local chunk = loadstring("data = " .. tostring(data))
+  if not chunk then
+    return nil
+  end
+  setfenv(chunk, env)
+  if not pcall(chunk) then
+    return nil
+  end
+  return env.data
+end
+
+local function update_gmcp(package)
+  local key = lower(package)
+  if key == "room.info" then
+    local room = gmcp_value("room.info")
+    if type(room) == "table" then
+      trailhead.gmcp.room = {
+        num = room.num and tostring(room.num) or nil,
+        name = room.name and tostring(room.name) or nil,
+        zone = room.zone and tostring(room.zone) or nil
+      }
+    end
+  elseif key == "char.status" then
+    local status = gmcp_value("char.status")
+    if type(status) == "table" then
+      trailhead.gmcp.level = tonumber(status.level) or trailhead.gmcp.level
+      trailhead.gmcp.state = tonumber(status.state) or trailhead.gmcp.state
+    end
+  elseif key == "char.base" then
+    local base = gmcp_value("char.base")
+    if type(base) == "table" then
+      trailhead.gmcp.tier = tonumber(base.tier) or trailhead.gmcp.tier
+      trailhead.gmcp.character = base.name and tostring(base.name) or trailhead.gmcp.character
+    end
+  end
+end
+
+local function mapper_lookup_room(uid)
+  uid = trim(uid)
+  if uid == "" then
+    return {}
+  end
+  if trailhead.room_cache[uid] then
+    return trailhead.room_cache[uid]
+  end
+
+  local result = { uid = uid }
+  local path = mapper_db_path()
+  local db = path and open_db(path, "Aardwolf.db") or nil
+  if db then
+    local ok = pcall(function()
+      for row in db:nrows(
+        "SELECT r.uid, r.name AS room_name, r.area AS area_uid, a.name AS area_name " ..
+        "FROM rooms r LEFT JOIN areas a ON a.uid = r.area " ..
+        "WHERE r.uid = " .. sql_literal(uid) .. " LIMIT 1"
+      ) do
+        result.name = row.room_name and tostring(row.room_name) or nil
+        result.area = row.area_uid and tostring(row.area_uid) or nil
+        result.area_name = row.area_name and tostring(row.area_name) or nil
+      end
+    end)
+    close_db(db)
+    if not ok then
+      result = { uid = uid }
+    end
+  end
+
+  trailhead.room_cache[uid] = result
+  return result
+end
+
+local function mapper_lookup_area(area)
+  area = trim(area)
+  if area == "" then
+    return nil
+  end
+  if trailhead.area_cache[area] ~= nil then
+    return trailhead.area_cache[area]
+  end
+
+  local name = nil
+  local path = mapper_db_path()
+  local db = path and open_db(path, "Aardwolf.db") or nil
+  if db then
+    pcall(function()
+      for row in db:nrows("SELECT name FROM areas WHERE uid = " .. sql_literal(area) .. " LIMIT 1") do
+        name = row.name and tostring(row.name) or nil
+      end
+    end)
+    close_db(db)
+  end
+
+  trailhead.area_cache[area] = name or false
+  return name
+end
+
+local function snd_context_json()
+  if type(IsPluginInstalled) == "function" then
+    local ok, installed = pcall(IsPluginInstalled, SND_ID)
+    if ok and not installed then
+      return nil
+    end
+  end
+  if type(CallPlugin) ~= "function" then
+    return nil
+  end
+  local ok, rc, text = pcall(CallPlugin, SND_ID, "target_as_json")
+  if not ok or rc ~= 0 or text == nil then
+    return nil
+  end
+  text = tostring(text)
+  if text == "" or text == "nil" or text == "null" then
+    return nil
+  end
+  return text
+end
+
+local function last_insert_id(db)
+  local id = nil
+  pcall(function()
+    for row in db:nrows("SELECT last_insert_rowid() AS id") do
+      id = tonumber(row.id)
+    end
+  end)
+  return id
+end
+
+local function insert_mapper_event(event)
+  local db, err = ensure_catalogue_db()
+  if not db then
+    warn("Trailhead monitor: " .. tostring(err))
+    return nil
+  end
+
+  local sql = string.format([[
+    INSERT INTO mapper_events (
+      observed_at, level, tier,
+      source_room, source_room_name, source_area, source_area_name,
+      destination_room, destination_room_name, destination_area, destination_area_name,
+      steps, broadcast_id, confidence, movement_confirmed, result_count,
+      reason, snd_context_json, raw
+    ) VALUES (
+      %s, %s, %s,
+      %s, %s, %s, %s,
+      %s, %s, %s, %s,
+      %s, %s, %s, %s, %s,
+      %s, %s, %s
+    )
+  ]],
+    sql_number(event.observed_at), sql_number(event.level), sql_number(event.tier),
+    sql_literal(event.source_room), sql_literal(event.source_room_name), sql_literal(event.source_area), sql_literal(event.source_area_name),
+    sql_literal(event.destination_room), sql_literal(event.destination_room_name), sql_literal(event.destination_area), sql_literal(event.destination_area_name),
+    sql_number(event.steps), sql_number(event.broadcast_id), sql_literal(event.confidence), sql_number(event.movement_confirmed or 0), sql_number(event.result_count or 1),
+    sql_literal(event.reason), sql_literal(event.snd_context_json), sql_literal(event.raw)
+  )
+
+  local ok, exec_err = db_exec(db, sql)
+  local id = ok and last_insert_id(db) or nil
+  close_db(db)
+  if not ok then
+    warn("Trailhead monitor: could not record mapper event: " .. tostring(exec_err))
+    return nil
+  end
+  return id
+end
+
+local function confirm_pending_walk()
+  local pending = trailhead.pending_walk
+  if not pending or not pending.id then
+    return
+  end
+  if os.time() - pending.observed_at > 5 then
+    trailhead.pending_walk = nil
+    return
+  end
+
+  local db = ensure_catalogue_db()
+  if db then
+    db_exec(db, "UPDATE mapper_events SET movement_confirmed = 1 WHERE id = " .. sql_number(pending.id))
+    close_db(db)
+  end
+  trailhead.pending_walk = nil
+end
+
+local function persist_cache()
+  if not trailhead.has_results then
+    SetVariable("trailhead_cache_v1", "")
+    SetVariable("trailhead_cache_source", source_room())
+    return
+  end
+  local lines = {}
+  for _, row in ipairs(trailhead.rows) do
+    lines[#lines + 1] = table.concat({
+      encode_field(row.key),
+      encode_field(row.name),
+      encode_field(row.start),
+      encode_field(row.min),
+      encode_field(row.max),
+      encode_field(row.walk),
+      encode_field(row.portal),
+      encode_field(row.status)
+    }, "|")
+  end
+  SetVariable("trailhead_cache_v1", table.concat(lines, "\n"))
+  SetVariable("trailhead_cache_source", source_room())
+end
+
+local function load_cache()
+  local cached_source = trim(GetVariable("trailhead_cache_source") or "")
+  local text = GetVariable("trailhead_cache_v1") or ""
+  if cached_source ~= source_room() or text == "" then
+    return false
+  end
+
+  local rows = {}
+  for line in tostring(text):gmatch("([^\n]+)") do
+    local fields = {}
+    for field in (line .. "|"):gmatch("([^|]*)|") do
+      fields[#fields + 1] = decode_field(field)
+    end
+    if fields[1] and fields[1] ~= "" then
+      rows[#rows + 1] = {
+        key = fields[1] or "",
+        name = fields[2] or "",
+        start = fields[3] or "",
+        min = numeric_or_nil(fields[4]),
+        max = numeric_or_nil(fields[5]),
+        walk = numeric_or_nil(fields[6]),
+        portal = numeric_or_nil(fields[7]),
+        status = fields[8] ~= "" and fields[8] or nil
+      }
+    end
+  end
+
+  if #rows == 0 then
+    return false
+  end
+  trailhead.rows = rows
+  trailhead.has_results = true
+  return true
+end
+
+local function read_areas()
+  local path = snd_db_path()
+  local db, err = open_db(path, "SnDdb.db")
+  if not db then
+    return nil, err
+  end
+
+  local rows = {}
+  local ok, query_err = pcall(function()
+    for row in db:nrows([[
+      SELECT key, name, startRoom, minlvl, maxlvl
+      FROM area
+      ORDER BY key COLLATE NOCASE, name COLLATE NOCASE
+    ]]) do
+      rows[#rows + 1] = {
+        key = tostring(row.key or ""),
+        name = tostring(row.name or ""),
+        start = row.startRoom and tostring(row.startRoom) or "",
+        min = row.minlvl,
+        max = row.maxlvl,
+        walk = nil,
+        portal = nil,
+        status = nil
+      }
+    end
+  end)
+  close_db(db)
+
+  if not ok then
+    return nil, tostring(query_err)
+  end
+  return rows, nil
+end
+
+local function merge_rows(existing, updated)
+  local merged = {}
+  local positions = {}
+  for _, row in ipairs(existing or {}) do
+    local copy = row
+    merged[#merged + 1] = copy
+    positions[copy.key] = #merged
+  end
+  for _, row in ipairs(updated or {}) do
+    local position = positions[row.key]
+    if position then
+      merged[position] = row
+    else
+      merged[#merged + 1] = row
+      positions[row.key] = #merged
+    end
+  end
+  return merged
+end
+
+local function select_one_area(rows, label)
+  local needle = lower(trim(label))
+  local contains = {}
+  for _, row in ipairs(rows) do
+    if lower(row.key) == needle or lower(row.name) == needle then
+      return { row }, nil
+    end
+    if lower(row.key):find(needle, 1, true) or lower(row.name):find(needle, 1, true) then
+      contains[#contains + 1] = row
+    end
+  end
+  if #contains == 1 then
+    return contains, nil
+  end
+  if #contains == 0 then
+    return {}, nil
+  end
+  return nil, "Trailhead: '" .. label .. "' matched " .. #contains .. " areas; be more specific."
+end
+
+local function path_length_from_broadcast(text)
+  local paths, err = parse_lua_assignment(text)
+  if not paths then
+    return nil, err
+  end
+  if type(paths) ~= "table" then
+    return nil, "no found_paths table"
+  end
+  return #paths, paths[#paths] and tostring(paths[#paths].uid or "") or nil
+end
+
+local function source_context()
+  local room = trailhead.gmcp.room or {}
+  local source = room.num and mapper_lookup_room(room.num) or {}
+  local area = source.area or room.zone
+  return {
+    room = source.uid or room.num,
+    room_name = source.name or room.name,
+    area = area,
+    area_name = source.area_name or mapper_lookup_area(area)
+  }
+end
+
+local function event_from_destination(destination, steps, broadcast_id, confidence, result_count, reason, raw)
+  local source = source_context()
+  local dest = mapper_lookup_room(destination)
+  local dest_area = dest.area
+  return {
+    observed_at = os.time(),
+    level = trailhead.gmcp.level,
+    tier = trailhead.gmcp.tier,
+    source_room = source.room,
+    source_room_name = source.room_name,
+    source_area = source.area,
+    source_area_name = source.area_name,
+    destination_room = dest.uid or tostring(destination),
+    destination_room_name = dest.name,
+    destination_area = dest_area,
+    destination_area_name = dest.area_name or mapper_lookup_area(dest_area),
+    steps = tonumber(steps) or 0,
+    broadcast_id = broadcast_id,
+    confidence = confidence,
+    movement_confirmed = 0,
+    result_count = result_count or 1,
+    reason = reason,
+    snd_context_json = snd_context_json(),
+    raw = raw
+  }
+end
+
+local function count_pairs(values)
+  local count = 0
+  for _ in pairs(values or {}) do
+    count = count + 1
+  end
+  return count
+end
+
+local function record_found_paths_500(text)
+  local paths = parse_lua_assignment(text)
+  if type(paths) ~= "table" then
+    return
+  end
+  local result_count = count_pairs(paths)
+  if result_count == 0 then
+    return
+  end
+
+  local inserted = nil
+  for uid, details in pairs(paths) do
+    local path = type(details) == "table" and details.path or nil
+    local reason = type(details) == "table" and details.reason or nil
+    local steps = type(path) == "table" and #path or nil
+    if steps then
+      local event = event_from_destination(
+        tostring(uid),
+        steps,
+        500,
+        result_count == 1 and "single_mapper_result" or "mapper_search_result",
+        result_count,
+        reason == true and nil or reason,
+        text
+      )
+      inserted = insert_mapper_event(event) or inserted
+      if result_count == 1 and inserted then
+        trailhead.pending_walk = { id = inserted, observed_at = event.observed_at }
+      end
+    end
+  end
+end
+
+local function record_found_paths_502(text)
+  local paths = parse_lua_assignment(text)
+  if type(paths) ~= "table" then
+    return
+  end
+  local last = paths[#paths]
+  if type(last) ~= "table" or not last.uid then
+    return
+  end
+  local event = event_from_destination(
+    tostring(last.uid),
+    #paths,
+    502,
+    "findpath_inferred",
+    1,
+    nil,
+    text
+  )
+  insert_mapper_event(event)
+end
+
+local function row_status(row)
+  local start = tonumber(row.start or "")
+  if not start or start <= 0 then
+    return "no-start"
+  end
+  if row.walk == nil and row.portal == nil then
+    return "no-path"
+  end
+  if row.walk == nil then
+    return "portal-only"
+  end
+  return "ok"
+end
+
+local function truncate(value, width)
+  value = tostring(value or "")
+  if #value <= width then
+    return value
+  end
+  if width <= 1 then
+    return value:sub(1, width)
+  end
+  return value:sub(1, width - 1) .. "~"
+end
+
+local function distance(value)
+  if value == nil then
+    return "--"
+  end
+  return tostring(value)
+end
+
+local function best_distance(row)
+  local walk = tonumber(row.walk)
+  local portal = tonumber(row.portal)
+  if walk and portal then
+    return math.min(walk, portal)
+  end
+  return portal or walk
+end
+
+local function print_header()
+  info("+----------------+--------+------+--------+----------+------------------------------------------+-------------+")
+  info("| Area           | Start  | Walk | Portal | Levels   | Name                                     | Status      |")
+  info("+----------------+--------+------+--------+----------+------------------------------------------+-------------+")
+end
+
+local function print_row(row)
+  local levels = tostring(row.min or "?") .. "-" .. tostring(row.max or "?")
+  info(string.format(
+    "| %-14s | %6s | %4s | %6s | %-8s | %-40s | %-11s |",
+    truncate(row.key, 14),
+    truncate(row.start ~= "" and row.start or "--", 6),
+    truncate(distance(row.walk), 4),
+    truncate(distance(row.portal), 6),
+    truncate(levels, 8),
+    truncate(row.name, 40),
+    truncate(row.status, 11)
+  ))
+end
+
+local function print_table(rows, filter)
+  local shown = 0
+  print_header()
+  for _, row in ipairs(rows) do
+    row.status = row_status(row)
+    if not filter or filter(row) then
+      print_row(row)
+      shown = shown + 1
+    end
+  end
+  info("+----------------+--------+------+--------+----------+------------------------------------------+-------------+")
+  info("shown " .. shown .. " row" .. (shown == 1 and "" or "s"))
+end
+
+local function print_refresh_row(row)
+  row.status = row_status(row)
+  info(string.format(
+    "Trailhead refresh: %-14s start=%s walk=%s portal=%s status=%s",
+    truncate(row.key, 14),
+    row.start ~= "" and row.start or "--",
+    distance(row.walk),
+    distance(row.portal),
+    row.status
+  ))
+end
+
+local function finish_report()
+  trailhead.active = false
+  trailhead.has_results = true
+  local refreshed = #trailhead.rows
+  if trailhead.prior_rows then
+    trailhead.rows = merge_rows(trailhead.prior_rows, trailhead.rows)
+    trailhead.prior_rows = nil
+  end
+  local total, no_start, no_path, portal_only = 0, 0, 0, 0
+  for _, row in ipairs(trailhead.rows) do
+    row.status = row_status(row)
+    total = total + 1
+    if row.status == "no-start" then no_start = no_start + 1 end
+    if row.status == "no-path" then no_path = no_path + 1 end
+    if row.status == "portal-only" then portal_only = portal_only + 1 end
+  end
+
+  good(string.format("Trailhead v%s | source %s | refreshed %d | cached %d areas", TRAILHEAD_VERSION, source_room(), refreshed, total))
+  info(string.format("no-start %d | no-path %d | portal-only %d", no_start, no_path, portal_only))
+  persist_cache()
+end
+
+local function next_request()
+  while trailhead.index <= #trailhead.rows do
+    local row = trailhead.rows[trailhead.index]
+    local start = tonumber(row.start or "")
+    if not start or start <= 0 then
+      print_refresh_row(row)
+      trailhead.index = trailhead.index + 1
+      trailhead.mode = "walk"
+    else
+      local mode = trailhead.mode
+      local noportals = mode == "walk"
+      local norecalls = mode == "walk"
+      trailhead.token = trailhead.token + 1
+      trailhead.waiting = {
+        index = trailhead.index,
+        mode = mode,
+        dest = tostring(start),
+        token = trailhead.token
+      }
+
+      if source_room() == tostring(start) then
+        if mode == "walk" then
+          row.walk = 0
+          trailhead.mode = "portal"
+        else
+          row.portal = 0
+          print_refresh_row(row)
+          trailhead.index = trailhead.index + 1
+          trailhead.mode = "walk"
+        end
+        trailhead.waiting = nil
+        return next_request()
+      end
+
+      local pending = trailhead.waiting
+      local rc, path, depth = CallPlugin(MAPPER_ID, "findpath", source_room(), tostring(start), noportals, norecalls)
+      if trailhead.waiting == pending and type(depth) == "number" then
+        if mode == "walk" then
+          row.walk = depth
+          trailhead.mode = "portal"
+        else
+          row.portal = depth
+          print_refresh_row(row)
+          trailhead.index = trailhead.index + 1
+          trailhead.mode = "walk"
+        end
+        trailhead.waiting = nil
+        return next_request()
+      elseif trailhead.waiting == pending and type(path) == "table" then
+        if mode == "walk" then
+          row.walk = #path
+          trailhead.mode = "portal"
+        else
+          row.portal = #path
+          print_refresh_row(row)
+          trailhead.index = trailhead.index + 1
+          trailhead.mode = "walk"
+        end
+        trailhead.waiting = nil
+        return next_request()
+      end
+
+      if trailhead.waiting == pending then
+        DoAfterSpecial(DEFAULT_TIMEOUT, "trailhead_timeout(" .. tostring(pending.token) .. ")", 12)
+      end
+      return
+    end
+  end
+  finish_report()
+end
+
+function trailhead_timeout(token)
+  if not trailhead.active or not trailhead.waiting then
+    return
+  end
+  if tonumber(token) ~= tonumber(trailhead.waiting.token) then
+    return
+  end
+  local row = trailhead.rows[trailhead.waiting.index]
+  if row then
+    if trailhead.waiting.mode == "walk" then
+      trailhead.mode = "portal"
+    else
+      print_refresh_row(row)
+      trailhead.index = trailhead.index + 1
+      trailhead.mode = "walk"
+    end
+  end
+  trailhead.waiting = nil
+  next_request()
+end
+
+function OnPluginBroadcast(msg, id, name, text)
+  if id == GMCP_ID then
+    update_gmcp(text)
+    return
+  end
+
+  if id ~= MAPPER_ID then
+    return
+  end
+
+  local message = tonumber(msg)
+  if message == 999 then
+    if tostring(text or "") == "kinda_busy" then
+      confirm_pending_walk()
+    elseif tostring(text or "") == "ok_you_can_go_now" then
+      trailhead.pending_walk = nil
+    end
+    return
+  end
+
+  if message == 502 and trailhead.active and trailhead.waiting then
+    local length, final_uid = path_length_from_broadcast(text)
+    if not length then
+      return
+    end
+    local pending = trailhead.waiting
+    if final_uid and final_uid ~= "" and final_uid ~= pending.dest then
+      return
+    end
+    local row = trailhead.rows[pending.index]
+    if not row then
+      return
+    end
+    if pending.mode == "walk" then
+      row.walk = length
+      trailhead.mode = "portal"
+    else
+      row.portal = length
+      print_refresh_row(row)
+      trailhead.index = trailhead.index + 1
+      trailhead.mode = "walk"
+    end
+    trailhead.waiting = nil
+    next_request()
+    return
+  end
+
+  if not monitor_enabled() or trailhead.active then
+    return
+  end
+
+  if message == 500 then
+    record_found_paths_500(text)
+  elseif message == 502 then
+    record_found_paths_502(text)
+  end
+end
+
+local function start_refresh(label)
+  local rows, err = read_areas()
+  if not rows then
+    fail("[Trailhead] " .. tostring(err))
+    return
+  end
+  if label and label ~= "" then
+    rows, err = select_one_area(rows, label)
+    if err then
+      warn(err)
+      return
+    end
+  end
+  if #rows == 0 then
+    if label and label ~= "" then
+      warn("Trailhead: no S&D area matched '" .. label .. "'.")
+    else
+      warn("Trailhead: S&D area table is empty.")
+    end
+    return
+  end
+  trailhead.active = true
+  trailhead.prior_rows = label and label ~= "" and trailhead.has_results and trailhead.rows or nil
+  trailhead.rows = rows
+  trailhead.has_results = false
+  trailhead.index = 1
+  trailhead.mode = "walk"
+  trailhead.waiting = nil
+  trailhead.token = 0
+  if label and label ~= "" then
+    info("Trailhead: refreshing '" .. label .. "' from " .. source_room() .. "...")
+  else
+    info("Trailhead: refreshing mapper distances from " .. source_room() .. "...")
+  end
+  next_request()
+end
+
+local function show_results(filter)
+  if trailhead.active then
+    warn("Trailhead: refresh is already running.")
+    return
+  end
+  if not trailhead.has_results or #trailhead.rows == 0 then
+    warn("Trailhead: no cached results. Run 'trailhead refresh' first.")
+    return
+  end
+  good(string.format("Trailhead v%s | source %s | cached %d areas", TRAILHEAD_VERSION, source_room(), #trailhead.rows))
+  print_table(trailhead.rows, filter)
+end
+
+local function show_areas_by_steps()
+  if trailhead.active then
+    warn("Trailhead: refresh is already running.")
+    return
+  end
+  if not trailhead.has_results or #trailhead.rows == 0 then
+    warn("Trailhead: no cached results. Run 'trailhead refresh' first.")
+    return
+  end
+
+  local groups = {}
+  local steps = {}
+  for _, row in ipairs(trailhead.rows) do
+    local best = best_distance(row)
+    if best then
+      if not groups[best] then
+        groups[best] = {}
+        steps[#steps + 1] = best
+      end
+      groups[best][#groups[best] + 1] = row.key ~= "" and row.key or row.name
+    end
+  end
+
+  if #steps == 0 then
+    warn("Trailhead: no cached distances. Run 'trailhead refresh' first.")
+    return
+  end
+
+  table.sort(steps, function(a, b) return a > b end)
+  for _, walk in ipairs(steps) do
+    table.sort(groups[walk])
+    info(string.format(
+      "%d step%s: %s",
+      walk,
+      walk == 1 and "" or "s",
+      table.concat(groups[walk], ", ")
+    ))
+  end
+end
+
+local function catalogue_count()
+  local path = trailhead_db_path()
+  if not path or not file_exists(path) then
+    return 0
+  end
+  local db = open_db(path, "trailhead.db")
+  if not db then
+    return 0
+  end
+  local count = 0
+  pcall(function()
+    for row in db:nrows("SELECT COUNT(*) AS count FROM mapper_events") do
+      count = tonumber(row.count) or 0
+    end
+  end)
+  close_db(db)
+  return count
+end
+
+local function monitor_command(arg)
+  arg = lower(trim(arg))
+  if arg == "on" then
+    local db, err = ensure_catalogue_db()
+    if not db then
+      fail("Trailhead monitor: " .. tostring(err))
+      return
+    end
+    close_db(db)
+    set_monitor_enabled(true)
+    good("Trailhead monitor is on.")
+    info("Catalogue: " .. trailhead_db_path())
+  elseif arg == "off" then
+    set_monitor_enabled(false)
+    trailhead.pending_walk = nil
+    good("Trailhead monitor is off.")
+  elseif arg == "" or arg == "status" then
+    info("Trailhead monitor: " .. (monitor_enabled() and "on" or "off"))
+    info("Catalogue: " .. tostring(trailhead_db_path() or "(unavailable)"))
+    info("Events: " .. tostring(catalogue_count()))
+  else
+    warn("Usage: trailhead monitor [on|off]")
+  end
+end
+
+local function display_value(value, fallback)
+  value = trim(value)
+  if value == "" then
+    return fallback or "--"
+  end
+  return value
+end
+
+local function show_walks(arg)
+  arg = trim(arg)
+  local include_all = false
+  local limit = 20
+  local first, rest = arg:match("^(%S+)%s*(.-)$")
+  if lower(first or "") == "all" then
+    include_all = true
+    local trimmed_rest = trim(rest)
+    limit = tonumber(trimmed_rest) or limit
+  elseif first and first ~= "" then
+    limit = tonumber(first) or limit
+  end
+  limit = math.max(1, math.min(tonumber(limit) or 20, 200))
+
+  local path = trailhead_db_path()
+  if not path or not file_exists(path) then
+    warn("Trailhead: no walk catalogue yet. Run 'trailhead monitor on' first.")
+    return
+  end
+  local db, err = open_db(path, "trailhead.db")
+  if not db then
+    warn("Trailhead: " .. tostring(err))
+    return
+  end
+
+  local where = include_all and "1 = 1" or "movement_confirmed = 1"
+  local shown = 0
+  info("+-------+---------+----------------------+----------------------+----------------------+----------------+")
+  info("| Steps | L/T     | From                 | To                   | Destination          | Seen           |")
+  info("+-------+---------+----------------------+----------------------+----------------------+----------------+")
+  local ok, query_err = pcall(function()
+    for row in db:nrows(string.format([[
+      SELECT observed_at, level, tier, source_room, source_area, destination_room,
+             destination_room_name, destination_area, steps, movement_confirmed
+      FROM mapper_events
+      WHERE %s
+      ORDER BY steps DESC, observed_at DESC, id DESC
+      LIMIT %d
+    ]], where, limit)) do
+      shown = shown + 1
+      local source = display_value(row.source_area) .. ":" .. display_value(row.source_room)
+      local dest = display_value(row.destination_area) .. ":" .. display_value(row.destination_room)
+      local name = display_value(row.destination_room_name)
+      local lt = "L" .. display_value(row.level, "?") .. "/T" .. display_value(row.tier, "?")
+      local marker = tonumber(row.movement_confirmed) == 1 and "" or "?"
+      info(string.format(
+        "| %5s | %-7s | %-20s | %-20s | %-20s | %-14s |",
+        tostring(row.steps or "?") .. marker,
+        truncate(lt, 7),
+        truncate(source, 20),
+        truncate(dest, 20),
+        truncate(name, 20),
+        os.date("%m-%d %H:%M", tonumber(row.observed_at) or os.time())
+      ))
+    end
+  end)
+  close_db(db)
+  if not ok then
+    warn("Trailhead: could not read walk catalogue: " .. tostring(query_err))
+    return
+  end
+  info("+-------+---------+----------------------+----------------------+----------------------+----------------+")
+  info("shown " .. shown .. " walk" .. (shown == 1 and "" or "s") .. (include_all and " (all observations)" or ""))
+end
+
+local function show_help()
+  good("Trailhead v" .. TRAILHEAD_VERSION)
+  info("  trailhead / th            Show cached area table.")
+  info("  trailhead areas           Group cached areas by best distance.")
+  info("  trailhead refresh [area]  Re-read S&D and mapper distances.")
+  info("  trailhead missing         Show no-start/no-path/portal-only rows.")
+  info("  trailhead area <key>      Show one area key or name fragment.")
+  info("  trailhead monitor [on|off]  Record observed mapper walks. Default: off.")
+  info("  trailhead walks [limit]   Show longest confirmed mapper walks.")
+  info("  trailhead walks all [n]   Include unconfirmed/search observations.")
+  info("  trailhead source [room]   Show or set source room. Default: 32418.")
+  info("Walk asks mapper findpath with no portals/recalls. Portal allows them.")
+end
+
+local function source_command(arg)
+  arg = trim(arg)
+  if arg == "" then
+    info("Trailhead source room: " .. source_room())
+    return
+  end
+  if not tonumber(arg) then
+    warn("Source room must be numeric.")
+    return
+  end
+  SetVariable("trailhead_source", tostring(tonumber(arg)))
+  trailhead.rows = {}
+  trailhead.has_results = false
+  persist_cache()
+  good("Trailhead source room set to " .. source_room())
+  warn("Trailhead cached distances were cleared; run 'trailhead refresh'.")
+end
+
+local function area_filter(value)
+  local needle = lower(trim(value))
+  return function(row)
+    return lower(row.key) == needle or lower(row.name):find(needle, 1, true) ~= nil
+  end
+end
+
+local function missing_filter(row)
+  return row.status ~= "ok"
+end
+
+function trailhead_alias(name, line, wildcards)
+  local arg = ""
+  if type(wildcards) == "table" then
+    arg = trim(wildcards[1] or "")
+  end
+  local command, rest = arg:match("^(%S+)%s*(.-)$")
+  command = lower(command or "")
+  rest = rest or ""
+
+  if command == "" or command == "list" then
+    show_results(nil)
+  elseif command == "areas" then
+    show_areas_by_steps()
+  elseif command == "refresh" then
+    local area = trim(rest)
+    if area == "" then
+      start_refresh(nil)
+    else
+      start_refresh(area)
+    end
+  elseif command == "missing" then
+    show_results(missing_filter)
+  elseif command == "area" then
+    if trim(rest) == "" then
+      warn("Usage: trailhead area <key>")
+    else
+      show_results(area_filter(rest))
+    end
+  elseif command == "monitor" then
+    monitor_command(rest)
+  elseif command == "walks" then
+    show_walks(rest)
+  elseif command == "source" then
+    source_command(rest)
+  elseif command == "help" or command == "?" then
+    show_help()
+  else
+    warn("Unknown Trailhead command: " .. command)
+    show_help()
+  end
+end
+
+function OnPluginSaveState()
+  persist_cache()
+end
+
+function OnPluginInstall()
+  local loaded = load_cache()
+  if loaded then
+    good("Trailhead v" .. TRAILHEAD_VERSION .. " installed with " .. #trailhead.rows .. " cached areas. Type 'trailhead help'.")
+  else
+    good("Trailhead v" .. TRAILHEAD_VERSION .. " installed. Type 'trailhead help'.")
+  end
+end

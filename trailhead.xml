@@ -1,0 +1,63 @@
+<?xml version="1.0" encoding="iso-8859-1"?>
+<!DOCTYPE muclient>
+
+<muclient>
+<plugin
+   name="Trailhead"
+   author="Rodarvus"
+   id="747261696c68656164303130"
+   language="Lua"
+   purpose="Report S&amp;D area start rooms and mapper distance from Aylor recall."
+   save_state="y"
+   date_written="2026-06-28"
+   requires="5.07"
+   version="0.1"
+   >
+<description trim="y">
+<![CDATA[
+Trailhead reports Search & Destroy area start rooms and their mapper distance
+from the configured Aylor recall source.
+
+Commands:
+  trailhead                 Show cached area table.
+  trailhead areas           Group cached areas by best distance.
+  trailhead refresh [area]  Re-read S&D and mapper distances.
+  trailhead missing         Show only missing/unreachable areas.
+  trailhead area <key>      Show one area.
+  trailhead monitor [on|off] Record observed mapper walks. Default: off.
+  trailhead walks [limit]   Show longest confirmed mapper walks.
+  trailhead walks all [n]   Include unconfirmed/search observations.
+  trailhead source [room]   Show or set the source room. Default: 32418.
+  trailhead help            Show help.
+
+Short alias: th
+]]>
+</description>
+</plugin>
+
+<aliases>
+  <alias
+   match="^trailhead(?:\s+(.*))?$"
+   regexp="y"
+   enabled="y"
+   send_to="12"
+   sequence="100"
+   script="trailhead_alias"
+  ></alias>
+  <alias
+   match="^th(?:\s+(.*))?$"
+   regexp="y"
+   enabled="y"
+   send_to="12"
+   sequence="100"
+   script="trailhead_alias"
+  ></alias>
+</aliases>
+
+<script>
+<![CDATA[
+dofile(GetPluginInfo(GetPluginID(), 20) .. "trailhead.lua")
+]]>
+</script>
+
+</muclient>

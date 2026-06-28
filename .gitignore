@@ -1,0 +1,10 @@
+.DS_Store
+
+# Proteles local plugin-library metadata.
+plugin.json
+
+# Runtime state and captured mapper catalogue data.
+data/
+*.db
+*.db-shm
+*.db-wal
