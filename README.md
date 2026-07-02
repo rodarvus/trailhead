@@ -8,7 +8,8 @@ Trailhead also runs in Proteles through its MUSHclient compatibility shim.
 
 ## Install
 
-Load `trailhead.xml` as a MUSHclient plugin.
+Load `trailhead.xml` as a MUSHclient plugin. The plugin is self-contained in
+that XML file.
 
 The short command alias is `th`.
 
