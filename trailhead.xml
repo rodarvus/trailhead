@@ -11,7 +11,7 @@
    save_state="y"
    date_written="2026-06-28"
    requires="5.07"
-   version="0.3"
+   version="0.4"
    >
 <description trim="y">
 <![CDATA[
@@ -60,7 +60,7 @@ Short alias: th
 
 <script>
 <![CDATA[
-local TRAILHEAD_VERSION = "0.3"
+local TRAILHEAD_VERSION = "0.4"
 local MAPPER_ID = "b6eae87ccedd84f510b74714"
 local GMCP_ID = "3e7dedbe37e44942dd46d264"
 local SND_ID = "30000000537461726C696E67"
@@ -276,10 +276,21 @@ local function directory_exists(path)
   if not path or path == "" then
     return false
   end
+  path = slash(path)
   if type(utils) == "table" and type(utils.readdir) == "function" then
-    local ok, result = pcall(utils.readdir, path)
-    if ok and result then
-      return true
+    local base = path:gsub("/$", "")
+    local checks = {
+      path,
+      base .. "/.",
+      base .. "/*",
+      base:gsub("/", "\\") .. "\\.",
+      base:gsub("/", "\\") .. "\\*"
+    }
+    for _, check in ipairs(checks) do
+      local ok, result = pcall(utils.readdir, check)
+      if ok and result then
+        return true
+      end
     end
   end
   local marker = path:gsub("/$", "") .. "/."
@@ -291,31 +302,38 @@ local function directory_exists(path)
   return false
 end
 
+local function run_mkdir(path)
+  if os and type(os.execute) == "function" then
+    local command
+    if path:match("^%a:/") then
+      local win_path = path:gsub("/$", ""):gsub("/", "\\")
+      command = 'cmd /C if not exist "' .. win_path .. '\\." mkdir "' .. win_path .. '"'
+    else
+      local quoted = "'" .. path:gsub("'", "'\\''") .. "'"
+      command = "mkdir -p " .. quoted
+    end
+    local ok = os.execute(command)
+    if ok == true or ok == 0 then
+      return true
+    end
+  end
+
+  if type(utils) == "table" and type(utils.shellexecute) == "function" then
+    local win_path = path:gsub("/$", ""):gsub("/", "\\")
+    local params = '/C if not exist "' .. win_path .. '\\." mkdir "' .. win_path .. '"'
+    local ok, launched = pcall(utils.shellexecute, "cmd", params, get_info(64) or "", "open", 0)
+    return ok and launched == true
+  end
+
+  return false
+end
+
 local function make_directory(path)
   if not path or path == "" or directory_exists(path) then
     return true
   end
 
-  if type(utils) == "table" and type(utils.shellexecute) == "function" then
-    local ok = pcall(utils.shellexecute, "cmd", '/C mkdir "' .. path .. '"', get_info(64) or "", "open", 0)
-    if ok and directory_exists(path) then
-      return true
-    end
-  end
-
-  if os and type(os.execute) == "function" then
-    local quoted = '"' .. path:gsub('"', '\\"') .. '"'
-    local ok = os.execute("mkdir -p " .. quoted)
-    if ok == true or ok == 0 then
-      return true
-    end
-    os.execute('mkdir "' .. path .. '"')
-    if directory_exists(path) then
-      return true
-    end
-  end
-
-  return directory_exists(path)
+  return run_mkdir(path) or directory_exists(path)
 end
 
 local function ensure_sqlite()
